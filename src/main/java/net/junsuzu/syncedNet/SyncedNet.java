@@ -28,6 +28,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.stream.Collectors;
 
 @Plugin(id = "syncednet", name = "SyncedNet", version = BuildConstants.VERSION, description = "MGMGのPlugin", url = "jun-suzu.net", authors = {"JUN-SUZU"})
@@ -40,6 +42,9 @@ public class SyncedNet {
     private ProxyServer server;
 
     public static final MinecraftChannelIdentifier CHANNEL = MinecraftChannelIdentifier.from("syncnet:gate");
+
+    // UUID → 転送リクエスト（Gate ID とターゲットサーバー名）
+    private final ConcurrentMap<UUID, TransferRequest> transferQueue = new ConcurrentHashMap<>();
 
     @Subscribe
     public void onProxyInitialization(ProxyInitializeEvent event) {
@@ -66,14 +71,6 @@ public class SyncedNet {
             }
             player.sendMessage(Component.text(sender.getUsername() + ": " + message));
         }
-    }
-
-    @Subscribe
-    public void onServerConnected(ServerConnectedEvent event) {
-        Player player = event.getPlayer();
-
-        // ここでタブリストを同期
-        syncTabList(player);
     }
 
     @Subscribe
@@ -204,27 +201,65 @@ public class SyncedNet {
             if (serverConn.getServerInfo().getName().equalsIgnoreCase(targetServer)) {
                 return;
             }
-            Optional<RegisteredServer> dest = server.getServer(targetServer);
-            dest.ifPresent(server -> {
-                // send gate_enter to targetServer backend
-                ByteArrayDataOutput out = ByteStreams.newDataOutput();
-                out.writeUTF("gate_enter");
-                out.writeUTF(targetGate);
-                out.writeUTF(playerUUID.toString());
-                server.sendPluginMessage(CHANNEL, out.toByteArray());
-            });
+//            Optional<RegisteredServer> dest = server.getServer(targetServer);
+//            dest.ifPresent(server -> {
+//                // send gate_enter to targetServer backend
+//                ByteArrayDataOutput out = ByteStreams.newDataOutput();
+//                out.writeUTF("gate_enter");
+//                out.writeUTF(targetGate);
+//                out.writeUTF(playerUUID.toString());
+//                server.sendPluginMessage(CHANNEL, out.toByteArray());
+//            });
+            TransferRequest tr = new TransferRequest(targetServer, targetGate);
+            transferQueue.put(playerUUID, tr);
+            server.getPlayer(playerUUID).get().createConnectionRequest(server.getServer(targetServer).get()).connect();
         }
-        else if ("gate_prepared".equals(action)) {
-            UUID playerUUID = UUID.fromString(in.readUTF());
-            Optional<Player> optPlayer = server.getPlayer(playerUUID);
-            if (optPlayer.isEmpty()) return;
-            Player pl = optPlayer.get();
-            logger.info("Gate prepared for player: " + pl.getUsername() + " on server: " + serverConn.getServerInfo().getName());
-            Optional<RegisteredServer> dest = pl.getCurrentServer().flatMap(sc -> Optional.of(sc.getServer()));
-            if (dest.isEmpty()) return;
-            pl.createConnectionRequest(dest.get()).connect().thenAccept(result -> {
-                // 転送後の処理（必要なら）
-            });
+    }
+
+    @Subscribe
+    public void onServerConnected(ServerConnectedEvent event) {
+        Player player = event.getPlayer();
+
+        // ここでタブリストを同期
+        syncTabList(player);
+
+        UUID uid = player.getUniqueId();
+        String connectedServer = event.getServer().getServerInfo().getName();
+        // ここで転送キューを読み込み
+        TransferRequest req = transferQueue.get(uid);
+        if (req != null && req.targetServer.equalsIgnoreCase(connectedServer)) {
+            attemptSend(uid, req.targetServer, req.targetGate, 0);
+        }
+    }
+
+    private void attemptSend(UUID playerUUID, String targetServer, String targetGate, int retryCounter) {
+        RegisteredServer connectedServer = server.getServer(targetServer).orElse(null);
+        if (server == null) {
+            logger.warn("Target server not found: " + targetServer);
+            return;
+        }
+
+        ByteArrayDataOutput out = ByteStreams.newDataOutput();
+        out.writeUTF("gate_enter");
+        out.writeUTF(targetGate);
+        out.writeUTF(playerUUID.toString());
+
+        boolean sent = connectedServer.sendPluginMessage(CHANNEL, out.toByteArray());
+        if (sent) {
+            transferQueue.remove(playerUUID);
+            logger.info("Sent gate_enter for " + playerUUID + " to " + targetGate + "@" + targetServer);
+        } else {
+
+            // キューに残したままリトライ待ち
+            retryCounter++;
+            if (retryCounter > 5) logger.info("Failed to send gate_enter (server probably not ready yet), endconnection: " +
+                    targetGate + "@" + targetServer);
+//            attemptSend(playerUUID, targetServer, targetGate, retryCounter);
+            final int finalRetryCounter = retryCounter;
+            server.getScheduler()
+                    .buildTask(this, () -> attemptSend(playerUUID, targetServer, targetGate, finalRetryCounter))
+                    .delay(2, java.util.concurrent.TimeUnit.SECONDS)
+                    .schedule();
         }
     }
 }
